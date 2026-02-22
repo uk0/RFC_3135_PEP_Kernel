@@ -1,0 +1,37 @@
+# Kernel build artifacts
+*.o
+*.o.d
+*.ko
+*.mod
+*.mod.c
+note.md
+reference_source
+reverse_meta
+test_records
+tcp_state_machine
+CLAUDE.md
+copy.sh
+PEP_CODE_FLOW.md
+PEP_INIT_TRACE.md
+PEP_REPORT.md
+reverse_proj.md
+RFC3135_APPEX_REPORT.zh.md
+*.mod.o
+*.symvers
+*.order
+.*.cmd
+.tmp_versions/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+
+# Claude Code
+.claude/
+.mcp.json
+
+# docs (per CLAUDE.md global rules)
+docs/
