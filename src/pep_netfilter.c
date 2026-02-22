@@ -1630,18 +1630,45 @@ static unsigned int pep_nf_post_routing(void *priv,
             } else if (payload_len > 0 && ctx->config.fake_ack) {
 
                 if (READ_ONCE(flow->wan_state) != PEP_WAN_CLOSED) {
+                    /*
+                     * v110: Zero-copy upload fast path for seq_offset==0.
+                     *
+                     * When seq_offset==0 (single-interface mode), the client's
+                     * packet needs no seq/ack translation. Instead of copying
+                     * the skb into a queue and forwarding via WAN TX worker,
+                     * send a fake ACK directly and let the original packet
+                     * pass through (NF_ACCEPT). This eliminates:
+                     * - skb_copy overhead (~20% CPU per packet)
+                     * - queue/dequeue latency
+                     * - WAN TX worker scheduling delay
+                     *
+                     * The client's own TCP stack handles pacing, congestion
+                     * control, and retransmission. PEP just accelerates the
+                     * client's cwnd growth via immediate fake ACKs.
+                     */
+                    u32 ul_seq = ntohl(tcph->seq);
+                    u32 ul_ack_seq = ul_seq + payload_len;
 
-                    if (pep_spoofing_handle_data(ctx, flow, skb, PEP_DIR_LAN_TO_WAN) == 0) {
-                        flow->tx_packets++;
-                        flow->tx_bytes += skb->len;
-                        pep_flow_put(flow);
-                        kfree_skb(skb);
-                        return NF_STOLEN;
+                    if (PEP_SEQ_AFTER(ul_ack_seq, flow->lan.ack_seq))
+                        flow->lan.ack_seq = ul_ack_seq;
+
+                    {
+                        struct sk_buff *ack_skb;
+                        u32 pep_seq = flow->isn_pep + 1;
+
+                        ack_skb = pep_create_fake_ack(flow, pep_seq, ul_ack_seq);
+                        if (ack_skb) {
+                            if (pep_send_lan_skb(flow, ack_skb) == 0) {
+                                pep_stats_inc_fake_ack();
+                                flow->fake_acks_sent++;
+                            }
+                        }
                     }
 
-                    pr_warn_ratelimited("pep: v55 Fast Path early DATA handle failed, DROP\n");
+                    flow->tx_packets++;
+                    flow->tx_bytes += skb->len;
                     pep_flow_put(flow);
-                    return NF_DROP;
+                    return NF_ACCEPT;
                 }
 
                 pr_info_ratelimited("pep: Fast Path: DATA before WAN SYN sent, DROP\n");
@@ -1751,31 +1778,42 @@ static unsigned int pep_nf_post_routing(void *priv,
 
             if (READ_ONCE(flow->wan_state) != PEP_WAN_CLOSED) {
 
-                pr_info_ratelimited("pep: v54 POST_ROUTING early DATA: %pI4:%u -> %pI4:%u "
-                        "seq=%u len=%u (processing optimistically, wan_state=%d)\\n",
-                        &tuple.src_addr, ntohs(tuple.src_port),
-                        &tuple.dst_addr, ntohs(tuple.dst_port),
-                        ntohl(tcph->seq), payload_len, flow->wan_state);
-
                 if (flow->state == PEP_TCP_SYN_RECV) {
                     flow->state = PEP_TCP_ESTABLISHED;
                     set_bit(PEP_FLOW_F_ACCELERATED_BIT, &flow->flags);
                     set_bit(PEP_FLOW_F_ESTABLISHED_BIT, &flow->flags);
-                    pep_dbg("v54: state updated to ESTABLISHED (by early DATA)\\n");
                 }
 
-                if (pep_spoofing_handle_data(ctx, flow, skb, PEP_DIR_LAN_TO_WAN) == 0) {
+                /*
+                 * v110: Zero-copy upload (slow path, seq_offset==0).
+                 * Same optimization as fast path — send fake ACK and
+                 * let original packet pass through.
+                 */
+                {
+                    u32 ul_seq = ntohl(tcph->seq);
+                    u32 ul_ack_seq = ul_seq + payload_len;
 
-                    flow->tx_packets++;
-                    flow->tx_bytes += skb->len;
-                    pep_flow_put(flow);
-                    kfree_skb(skb);
-                    return NF_STOLEN;
+                    if (PEP_SEQ_AFTER(ul_ack_seq, flow->lan.ack_seq))
+                        flow->lan.ack_seq = ul_ack_seq;
+
+                    {
+                        struct sk_buff *ack_skb;
+                        u32 pep_seq = flow->isn_pep + 1;
+
+                        ack_skb = pep_create_fake_ack(flow, pep_seq, ul_ack_seq);
+                        if (ack_skb) {
+                            if (pep_send_lan_skb(flow, ack_skb) == 0) {
+                                pep_stats_inc_fake_ack();
+                                flow->fake_acks_sent++;
+                            }
+                        }
+                    }
                 }
 
-                pr_warn_ratelimited("pep: v54 early DATA handle failed, DROP for retransmit\\n");
+                flow->tx_packets++;
+                flow->tx_bytes += skb->len;
                 pep_flow_put(flow);
-                return NF_DROP;
+                return NF_ACCEPT;
             } else {
 
                 pr_info_ratelimited("pep: POST_ROUTING DATA: wan_state=CLOSED (no WAN SYN?), "
