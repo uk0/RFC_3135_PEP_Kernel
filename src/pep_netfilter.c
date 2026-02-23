@@ -639,6 +639,28 @@ static unsigned int pep_nf_pre_routing(void *priv,
     if (!ctx || !atomic_read(&ctx->running) || !ctx->config.enabled)
         return NF_ACCEPT;
 
+    /* v109-diag: Log ALL TCP SYN-ACK before interface check */
+    if (pep_ctx && pep_ctx->config.debug_level >= 2 &&
+        pskb_may_pull(skb, sizeof(struct iphdr))) {
+        struct iphdr *diag_iph = ip_hdr(skb);
+        if (diag_iph->version == 4 && diag_iph->protocol == IPPROTO_TCP) {
+            unsigned int diag_ihl = diag_iph->ihl * 4;
+            if (pskb_may_pull(skb, diag_ihl + sizeof(struct tcphdr))) {
+                struct tcphdr *diag_tcph = (struct tcphdr *)((unsigned char *)diag_iph + diag_ihl);
+                if (diag_tcph->syn && diag_tcph->ack) {
+                    pr_info("pep: PRE_ROUTING DIAG SYN-ACK: %pI4:%u -> %pI4:%u "
+                            "in_dev=%s wan_dev=%s match=%d mark=0x%x\n",
+                            &diag_iph->saddr, ntohs(diag_tcph->source),
+                            &diag_iph->daddr, ntohs(diag_tcph->dest),
+                            state && state->in ? state->in->name : "NULL",
+                            ctx->wan_dev ? ctx->wan_dev->name : "NULL",
+                            pep_match_wan_in(ctx, state),
+                            skb->mark);
+                }
+            }
+        }
+    }
+
     if (!pep_match_wan_in(ctx, state))
         return NF_ACCEPT;
 
@@ -1435,6 +1457,7 @@ skip_fastpath_pre_routing:
     return NF_ACCEPT;
 }
 
+
 /*
  * 功能/Main: 处理Netfilter 报文路径（Handle Netfilter packet path）
  * 细节/Details: 处理 skb/packet（touch skb headers/csum）；解析/修改 IP/TCP 头字段（IP/TCP header handling）；分片重组/重排处理（fragment reassembly）；流表查找/创建/状态更新（flow lookup/create/update）；队列/链表维护（queue/list maintenance）；重传/缓存处理（retransmission/cache）；并发同步（spinlock/atomic/rcu）
@@ -1629,22 +1652,19 @@ static unsigned int pep_nf_post_routing(void *priv,
 
             } else if (payload_len > 0 && ctx->config.fake_ack) {
 
-                if (READ_ONCE(flow->wan_state) != PEP_WAN_CLOSED) {
+                if (READ_ONCE(flow->wan_state) == PEP_WAN_ESTABLISHED) {
                     /*
-                     * v110: Zero-copy upload fast path for seq_offset==0.
+                     * v112: Only forward data after WAN handshake completes.
                      *
-                     * When seq_offset==0 (single-interface mode), the client's
-                     * packet needs no seq/ack translation. Instead of copying
-                     * the skb into a queue and forwarding via WAN TX worker,
-                     * send a fake ACK directly and let the original packet
-                     * pass through (NF_ACCEPT). This eliminates:
-                     * - skb_copy overhead (~20% CPU per packet)
-                     * - queue/dequeue latency
-                     * - WAN TX worker scheduling delay
+                     * Previously checked != PEP_WAN_CLOSED, which allowed data
+                     * through when wan_state == SYN_SENT (before server SYN-ACK).
+                     * This caused data to reach the server with wrong ACK number
+                     * (isn_pep+1 instead of isn_server+1), confusing the server
+                     * and killing the connection.
                      *
-                     * The client's own TCP stack handles pacing, congestion
-                     * control, and retransmission. PEP just accelerates the
-                     * client's cwnd growth via immediate fake ACKs.
+                     * Now we only forward once wan_state == ESTABLISHED, meaning
+                     * the real SYN-ACK has arrived and seq_offset is computed.
+                     * The kernel will retransmit any data that was held back.
                      */
                     u32 ul_seq = ntohl(tcph->seq);
                     u32 ul_ack_seq = ul_seq + payload_len;
@@ -1654,7 +1674,8 @@ static unsigned int pep_nf_post_routing(void *priv,
 
                     {
                         struct sk_buff *ack_skb;
-                        u32 pep_seq = flow->isn_pep + 1;
+                        /* v113: dynamic PEP SEQ */
+                        u32 pep_seq = READ_ONCE(flow->wan.seq_next) + flow->seq_offset;
 
                         ack_skb = pep_create_fake_ack(flow, pep_seq, ul_ack_seq);
                         if (ack_skb) {
@@ -1671,7 +1692,8 @@ static unsigned int pep_nf_post_routing(void *priv,
                     return NF_ACCEPT;
                 }
 
-                pr_info_ratelimited("pep: Fast Path: DATA before WAN SYN sent, DROP\n");
+                pr_info_ratelimited("pep: Fast Path: DATA before WAN ESTABLISHED, DROP (wan_state=%d)\n",
+                        READ_ONCE(flow->wan_state));
                 pep_flow_put(flow);
                 return NF_DROP;
             }
@@ -1776,7 +1798,7 @@ static unsigned int pep_nf_post_routing(void *priv,
             return NF_DROP;
         } else if (payload_len > 0 && seq_off == 0 && ctx->config.fake_ack) {
 
-            if (READ_ONCE(flow->wan_state) != PEP_WAN_CLOSED) {
+            if (READ_ONCE(flow->wan_state) == PEP_WAN_ESTABLISHED) {
 
                 if (flow->state == PEP_TCP_SYN_RECV) {
                     flow->state = PEP_TCP_ESTABLISHED;
@@ -1788,6 +1810,7 @@ static unsigned int pep_nf_post_routing(void *priv,
                  * v110: Zero-copy upload (slow path, seq_offset==0).
                  * Same optimization as fast path — send fake ACK and
                  * let original packet pass through.
+                 * v111: Rate-limited to prevent softirq storm.
                  */
                 {
                     u32 ul_seq = ntohl(tcph->seq);
@@ -1798,7 +1821,8 @@ static unsigned int pep_nf_post_routing(void *priv,
 
                     {
                         struct sk_buff *ack_skb;
-                        u32 pep_seq = flow->isn_pep + 1;
+                        /* v113: dynamic PEP SEQ */
+                        u32 pep_seq = READ_ONCE(flow->wan.seq_next) + flow->seq_offset;
 
                         ack_skb = pep_create_fake_ack(flow, pep_seq, ul_ack_seq);
                         if (ack_skb) {
@@ -1816,8 +1840,9 @@ static unsigned int pep_nf_post_routing(void *priv,
                 return NF_ACCEPT;
             } else {
 
-                pr_info_ratelimited("pep: POST_ROUTING DATA: wan_state=CLOSED (no WAN SYN?), "
-                        "%pI4:%u -> %pI4:%u seq=%u len=%u (DROP)\\n",
+                pr_info_ratelimited("pep: POST_ROUTING DATA: wan_state=%d (not ESTABLISHED), "
+                        "%pI4:%u -> %pI4:%u seq=%u len=%u (DROP)\n",
+                        READ_ONCE(flow->wan_state),
                         &tuple.src_addr, ntohs(tuple.src_port),
                         &tuple.dst_addr, ntohs(tuple.dst_port),
                         ntohl(tcph->seq), payload_len);

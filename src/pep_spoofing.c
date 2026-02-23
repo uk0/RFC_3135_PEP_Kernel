@@ -376,7 +376,11 @@ void pep_ack_pacer_queue(struct pep_flow *flow, u32 ack_seq, u32 bytes)
 
         }
 
-        pep_seq = flow->isn_pep + 1;
+        /* v113: Use current PEP sequence toward client, not stale isn_pep+1.
+         * After client receives server data (e.g. HTTP 100 Continue),
+         * rcv_nxt advances; fake ACK with old SEQ is rejected as out-of-window.
+         */
+        pep_seq = READ_ONCE(flow->wan.seq_next) + flow->seq_offset;
         ack_skb = pep_create_fake_ack(flow, pep_seq, ack_seq);
         if (ack_skb) {
 
@@ -436,7 +440,8 @@ void pep_ack_pacer_flush(struct pep_flow *flow)
     }
 
     if (pacer->bytes_received > 0) {
-        pep_seq = flow->isn_pep + 1;
+        /* v113: dynamic PEP SEQ */
+        pep_seq = READ_ONCE(flow->wan.seq_next) + flow->seq_offset;
         ack_skb = pep_create_fake_ack(flow, pep_seq, pacer->pending_ack_seq);
         if (ack_skb) {
 
@@ -2447,6 +2452,12 @@ void pep_wan_tx_work_handler(struct work_struct *work)
     while (send_window > 0 && pep_pacing_can_send(flow)) {
         bool fully_processed = false;
 
+        /* v111: Iteration cap — yield CPU after N packets, reschedule */
+        if (sent >= PEP_WAN_TX_MAX_BATCH) {
+            pep_dbg("WAN TX: batch limit %d reached, rescheduling\n", sent);
+            break;
+        }
+
         if (test_bit(PEP_FLOW_F_DEAD_BIT, &flow->flags))
             break;
 
@@ -2971,7 +2982,8 @@ void pep_lan_tx_work_handler(struct work_struct *work)
         pacer->is_pending = 0;
 
         if (pacer->bytes_received > 0) {
-            pep_seq = flow->isn_pep + 1;
+            /* v113: dynamic PEP SEQ */
+            pep_seq = READ_ONCE(flow->wan.seq_next) + flow->seq_offset;
             ack_skb = pep_create_fake_ack(flow, pep_seq, pacer->pending_ack_seq);
             if (ack_skb) {
 
@@ -3257,7 +3269,8 @@ int pep_spoofing_handle_data(struct pep_context *ctx, struct pep_flow *flow,
          */
         {
             struct sk_buff *ack_skb;
-            u32 pep_seq = flow->isn_pep + 1;
+            /* v113: dynamic PEP SEQ — must match client's rcv_nxt */
+            u32 pep_seq = READ_ONCE(flow->wan.seq_next) + flow->seq_offset;
 
             ack_skb = pep_create_fake_ack(flow, pep_seq, ack_seq);
             if (ack_skb) {

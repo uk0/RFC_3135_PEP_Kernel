@@ -196,6 +196,9 @@
 #define PEP_DEFAULT_LOCAL_RETRANS_MAX_PKTS  4096
 #define PEP_DEFAULT_LOCAL_RETRANS_MAX_BYTES (32 * 1024 * 1024)
 
+/* v111: Anti-hang limits */
+#define PEP_WAN_TX_MAX_BATCH            64      /* Max packets per WAN TX work invocation */
+
 /* Shaper / policy defaults */
 #define PEP_DEFAULT_SHAPER_ENABLED       1
 #define PEP_DEFAULT_WAN_KBPS             0           /* 0 = derive from bandwidth_mbps */
@@ -1105,6 +1108,10 @@ struct pep_flow {
     u64 tx_bytes;
     u64 retrans_packets;
     u64 fake_acks_sent;
+
+    /* v111: Per-flow fake ACK rate limiter */
+    unsigned long fake_ack_jiffies;      /* last jiffies tick when budget reset */
+    int           fake_ack_budget;       /* remaining fake ACKs this tick */
 
     /* 时间戳 */
     ktime_t create_time;
